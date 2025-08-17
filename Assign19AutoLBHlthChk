@@ -1,0 +1,154 @@
+import os
+import json
+import logging
+from datetime import datetime, timezone
+
+import boto3
+from botocore.exceptions import BotoCoreError, ClientError
+
+logger = logging.getLogger()
+logger.setLevel(logging.INFO)
+elbv2 = boto3.client("elbv2")
+ec2 = boto3.client("ec2")
+sns = boto3.client("sns")
+
+HEALTH_OK = {"healthy"}
+HEALTH_WARN = {"initial", "draining", "unused", "unavailable"}
+HEALTH_BAD = {"unhealthy"}
+
+def _utc_now_iso():
+    return datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S %Z")
+
+def _list_target_groups(load_balancer_arn: str):
+    """Return all target groups attached to a given ALB."""
+    tgs = []
+    paginator = elbv2.get_paginator("describe_target_groups")
+    for page in paginator.paginate(LoadBalancerArn=load_balancer_arn):
+        tgs.extend(page.get("TargetGroups", []))
+    return tgs
+
+def _describe_targets(tg_arn: str):
+    """Return (target_type, health_descriptions)."""
+    # get target type + name
+    tg_desc = elbv2.describe_target_groups(TargetGroupArns=[tg_arn])["TargetGroups"][0]
+    target_type = tg_desc.get("TargetType", "instance")
+    tg_name = tg_desc.get("TargetGroupName")
+    health = elbv2.describe_target_health(TargetGroupArn=tg_arn)["TargetHealthDescriptions"]
+    return target_type, tg_name, health
+
+def _enrich_instances(instance_ids):
+    if not instance_ids:
+        return {}
+    resp = ec2.describe_instances(InstanceIds=instance_ids)
+    info = {}
+    for r in resp.get("Reservations", []):
+        for i in r.get("Instances", []):
+            iid = i["InstanceId"]
+            name = next((t["Value"] for t in i.get("Tags", []) if t["Key"] == "Name"), "")
+            state = i.get("State", {}).get("Name", "")
+            az = i.get("Placement", {}).get("AvailabilityZone", "")
+            info[iid] = {"Name": name, "State": state, "AZ": az}
+    return info
+
+def _format_line(target_id, az, port, state, reason, desc, meta):
+    label = target_id
+    if target_id in meta:
+        name = meta[target_id]["Name"]
+        if name:
+            label = f"{name} ({target_id})"
+        az = meta[target_id].get("AZ") or az
+        state = f"{state} / EC2:{meta[target_id].get('State','')}"
+    return f"- {label} | az={az} | port={port} | state={state} | reason={reason or '-'} | {desc or ''}"
+
+
+def lambda_handler(event, context):
+    # TODO implement
+    topic_arn = os.environ.get("SNS_TOPIC_ARN")
+    lb_arn = os.environ.get("LOAD_BALANCER_ARN")
+
+    if not topic_arn:
+        raise RuntimeError("SNS_TOPIC_ARN env var is required")
+    if not lb_arn:
+        raise RuntimeError("Set LOAD_BALANCER_ARN env var")
+    
+    try:
+        # Resolve target groups
+        tgs = []
+        if lb_arn:
+            tgs = [tg["TargetGroupArn"] for tg in _list_target_groups(lb_arn)]
+        
+        if not tgs:
+            logger.warning("No target groups found.")
+            return {"ok": True, "checked": 0, "unhealthy": 0}
+        overall_unhealthy = 0
+        overall = []
+
+        for tg in tgs:
+            target_type, tg_name, health_desc = _describe_targets(tg)
+
+            # Collect instance IDs for enrichment when target type is instance
+            instance_ids = [h["Target"]["Id"] for h in health_desc if target_type == "instance"]
+            meta = _enrich_instances(instance_ids)
+
+            tg_lines = []
+            counts = {"healthy": 0, "unhealthy": 0, "other": 0}
+            for h in health_desc:
+                target = h.get("Target", {})
+                th = h.get("TargetHealth", {})
+                state = th.get("State", "")
+                reason = th.get("Reason", "")
+                desc = th.get("Description", "")
+
+                # buckets
+                if state in HEALTH_OK:
+                    counts["healthy"] += 1
+                elif state in HEALTH_BAD:
+                    counts["unhealthy"] += 1
+                else:
+                    counts["other"] += 1
+
+                tg_lines.append(
+                    _format_line(
+                        target.get("Id"),
+                        h.get("AvailabilityZone", ""),
+                        target.get("Port"),
+                        state,
+                        reason,
+                        desc,
+                        meta,
+                    )
+                )
+
+            overall_unhealthy += counts["unhealthy"]
+            header = f"Target Group: {tg_name} ({target_type}) | healthy={counts['healthy']} unhealthy={counts['unhealthy']} other={counts['other']}"
+            overall.append("\n".join([header] + tg_lines))
+
+        # Decide whether to publish
+        subject = f"ALB/ELB Health Check: {overall_unhealthy} unhealthy target(s) @ { _utc_now_iso() }"
+        message = f"{subject}\n\n" + "\n\n".join(overall)
+
+        logger.info(subject)
+        logger.debug(message)
+
+        if overall_unhealthy > 0:
+            sns.publish(TopicArn=topic_arn, Subject=subject[:100], Message=message)
+            logger.info("Alert published to SNS.")
+        else:
+            logger.info("All targets healthy. No SNS message sent.")
+
+        return {
+            "ok": True,
+            "target_groups_checked": len(tgs),
+            "unhealthy_targets": overall_unhealthy
+        }
+
+    except (BotoCoreError, ClientError) as e:
+        logger.exception("Error checking ALB health.")
+        # Always publish on error so you find out
+        err_subject = f"ALB Health Check FAILED @ { _utc_now_iso() }"
+        err_msg = f"{err_subject}\n\n{type(e).__name__}: {str(e)}"
+        try:
+            sns.publish(TopicArn=topic_arn, Subject=err_subject[:100], Message=err_msg)
+        except Exception:
+            pass
+        raise
